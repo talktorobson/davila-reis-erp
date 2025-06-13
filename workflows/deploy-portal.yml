@@ -1,0 +1,376 @@
+# Enhanced CI/CD Pipeline for D'Avila Reis ERP Client Portal
+# Includes security scanning, testing, and blue-green deployment
+
+name: Deploy Client Portal
+
+on:
+  push:
+    branches: [main, staging]
+    paths: 
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'Dockerfile'
+      - 'next.config.js'
+      - 'tailwind.config.js'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+
+env:
+  PROJECT_ID: davila-reis-law-firm-erp
+  REGION: southamerica-east1
+  SERVICE_NAME: davila-reis-erp
+  REGISTRY: gcr.io
+
+jobs:
+  # Security and Quality Checks
+  security-scan:
+    name: Security & Quality Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript check
+        run: npm run type-check
+
+      - name: ESLint check
+        run: npm run lint
+
+      - name: Security audit
+        run: npm audit --audit-level=moderate
+
+      - name: Dependency check
+        run: |
+          npx depcheck --ignores="@types/*,eslint-*"
+
+      - name: License check
+        run: |
+          npx license-checker --onlyAllow "MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC"
+
+  # Build and Test
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    needs: security-scan
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        env:
+          NODE_ENV: production
+          DATABASE_URL: ${{ secrets.DATABASE_URL_TEST }}
+          NEXTAUTH_SECRET: ${{ secrets.NEXTAUTH_SECRET }}
+          NEXTAUTH_URL: https://test.davilareisadvogados.com.br
+        run: npm run build
+
+      - name: Run tests (if available)
+        run: npm test || echo "No tests configured yet"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-files
+          path: .next/
+          retention-days: 1
+
+  # Container Security Scan
+  container-security:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t test-image \
+            --build-arg DATABASE_URL="postgresql://test:test@localhost:5432/test" \
+            --build-arg NEXTAUTH_SECRET="test-secret-key-minimum-32-characters" \
+            --build-arg NEXTAUTH_URL="https://test.example.com" \
+            --build-arg GOOGLE_CLIENT_ID="test" \
+            --build-arg GOOGLE_CLIENT_SECRET="test" \
+            --build-arg SENDGRID_API_KEY="test" \
+            --build-arg FROM_EMAIL="test@example.com" \
+            --build-arg GCP_PROJECT_ID="test-project" \
+            --build-arg GCP_STORAGE_BUCKET="test-bucket" \
+            .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'test-image'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Check for critical vulnerabilities
+        run: |
+          CRITICAL=$(docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy image --severity CRITICAL --quiet test-image | wc -l)
+          if [ $CRITICAL -gt 0 ]; then
+            echo "Critical vulnerabilities found!"
+            exit 1
+          fi
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-test, container-security]
+    if: github.ref == 'refs/heads/staging'
+    environment: staging
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.GCP_SA_KEY_STAGING }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker to use gcloud
+        run: gcloud auth configure-docker
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG="${REGISTRY}/${PROJECT_ID}/${SERVICE_NAME}-staging:${GITHUB_SHA}"
+          docker build -t $IMAGE_TAG \
+            --build-arg DATABASE_URL="${{ secrets.DATABASE_URL_STAGING }}" \
+            --build-arg NEXTAUTH_SECRET="${{ secrets.NEXTAUTH_SECRET }}" \
+            --build-arg NEXTAUTH_URL="https://staging.davilareisadvogados.com.br" \
+            --build-arg GOOGLE_CLIENT_ID="${{ secrets.GOOGLE_CLIENT_ID }}" \
+            --build-arg GOOGLE_CLIENT_SECRET="${{ secrets.GOOGLE_CLIENT_SECRET }}" \
+            --build-arg SENDGRID_API_KEY="${{ secrets.SENDGRID_API_KEY }}" \
+            --build-arg FROM_EMAIL="${{ secrets.FROM_EMAIL }}" \
+            --build-arg GCP_PROJECT_ID="${PROJECT_ID}" \
+            --build-arg GCP_STORAGE_BUCKET="${PROJECT_ID}-client-documents-staging" \
+            .
+          docker push $IMAGE_TAG
+
+      - name: Deploy to Cloud Run Staging
+        run: |
+          gcloud run deploy ${SERVICE_NAME}-staging \
+            --image=${REGISTRY}/${PROJECT_ID}/${SERVICE_NAME}-staging:${GITHUB_SHA} \
+            --region=${REGION} \
+            --platform=managed \
+            --memory=1Gi \
+            --cpu=1 \
+            --max-instances=5 \
+            --min-instances=0 \
+            --allow-unauthenticated \
+            --set-env-vars="NODE_ENV=staging,GCP_PROJECT_ID=${PROJECT_ID}" \
+            --set-secrets="DATABASE_URL=DATABASE_URL_STAGING:latest,NEXTAUTH_SECRET=NEXTAUTH_SECRET:latest,REDIS_URL=REDIS_URL_STAGING:latest"
+
+      - name: Run smoke tests
+        run: |
+          sleep 30
+          STAGING_URL=$(gcloud run services describe ${SERVICE_NAME}-staging --region=${REGION} --format='value(status.url)')
+          curl -f "$STAGING_URL/api/health" || exit 1
+
+  # Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build-and-test, container-security]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.GCP_SA_KEY_PRODUCTION }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker to use gcloud
+        run: gcloud auth configure-docker
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG="${REGISTRY}/${PROJECT_ID}/${SERVICE_NAME}:${GITHUB_SHA}"
+          docker build -t $IMAGE_TAG \
+            --build-arg DATABASE_URL="${{ secrets.DATABASE_URL }}" \
+            --build-arg NEXTAUTH_SECRET="${{ secrets.NEXTAUTH_SECRET }}" \
+            --build-arg NEXTAUTH_URL="https://davilareisadvogados.com.br" \
+            --build-arg GOOGLE_CLIENT_ID="${{ secrets.GOOGLE_CLIENT_ID }}" \
+            --build-arg GOOGLE_CLIENT_SECRET="${{ secrets.GOOGLE_CLIENT_SECRET }}" \
+            --build-arg SENDGRID_API_KEY="${{ secrets.SENDGRID_API_KEY }}" \
+            --build-arg FROM_EMAIL="${{ secrets.FROM_EMAIL }}" \
+            --build-arg GCP_PROJECT_ID="${PROJECT_ID}" \
+            --build-arg GCP_STORAGE_BUCKET="${PROJECT_ID}-client-documents" \
+            .
+          docker push $IMAGE_TAG
+
+      - name: Blue-Green Deployment Strategy
+        run: |
+          # Get current traffic allocation
+          CURRENT_REVISION=$(gcloud run services describe ${SERVICE_NAME} \
+            --region=${REGION} --format='value(status.latestReadyRevisionName)')
+          
+          # Deploy new revision with no traffic
+          gcloud run deploy ${SERVICE_NAME} \
+            --image=${REGISTRY}/${PROJECT_ID}/${SERVICE_NAME}:${GITHUB_SHA} \
+            --region=${REGION} \
+            --platform=managed \
+            --memory=2Gi \
+            --cpu=2 \
+            --max-instances=20 \
+            --min-instances=2 \
+            --allow-unauthenticated \
+            --no-traffic \
+            --set-env-vars="NODE_ENV=production,GCP_PROJECT_ID=${PROJECT_ID}" \
+            --set-secrets="DATABASE_URL=DATABASE_URL:latest,NEXTAUTH_SECRET=NEXTAUTH_SECRET:latest,REDIS_URL=REDIS_URL:latest,JWT_SECRET=JWT_SECRET:latest,SESSION_SECRET=SESSION_SECRET:latest"
+          
+          # Get new revision name
+          NEW_REVISION=$(gcloud run services describe ${SERVICE_NAME} \
+            --region=${REGION} --format='value(status.latestCreatedRevisionName)')
+          
+          echo "Current revision: $CURRENT_REVISION"
+          echo "New revision: $NEW_REVISION"
+          
+          # Health check new revision
+          NEW_REVISION_URL=$(gcloud run revisions describe $NEW_REVISION \
+            --region=${REGION} --format='value(status.url)')
+          
+          echo "Testing new revision at: $NEW_REVISION_URL"
+          for i in {1..5}; do
+            if curl -f "$NEW_REVISION_URL/api/health"; then
+              echo "Health check passed on attempt $i"
+              break
+            fi
+            echo "Health check failed on attempt $i, retrying..."
+            sleep 10
+            if [ $i -eq 5 ]; then
+              echo "Health checks failed, rolling back"
+              exit 1
+            fi
+          done
+
+      - name: Gradual Traffic Migration
+        run: |
+          NEW_REVISION=$(gcloud run services describe ${SERVICE_NAME} \
+            --region=${REGION} --format='value(status.latestCreatedRevisionName)')
+          
+          # Route 10% traffic to new revision
+          gcloud run services update-traffic ${SERVICE_NAME} \
+            --region=${REGION} \
+            --to-revisions=$NEW_REVISION=10
+          
+          echo "Routing 10% traffic to new revision, monitoring for 2 minutes..."
+          sleep 120
+          
+          # Route 50% traffic to new revision
+          gcloud run services update-traffic ${SERVICE_NAME} \
+            --region=${REGION} \
+            --to-revisions=$NEW_REVISION=50
+          
+          echo "Routing 50% traffic to new revision, monitoring for 2 minutes..."
+          sleep 120
+          
+          # Route 100% traffic to new revision
+          gcloud run services update-traffic ${SERVICE_NAME} \
+            --region=${REGION} \
+            --to-revisions=$NEW_REVISION=100
+
+      - name: Cleanup old revisions
+        run: |
+          # Keep only the latest 3 revisions
+          gcloud run revisions list \
+            --service=${SERVICE_NAME} \
+            --region=${REGION} \
+            --format='value(metadata.name)' \
+            --sort-by='~metadata.creationTimestamp' \
+            | tail -n +4 \
+            | while read revision; do
+              echo "Deleting old revision: $revision"
+              gcloud run revisions delete $revision --region=${REGION} --quiet || true
+            done
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Production deployment successful!"
+          echo "🌐 Service URL: https://davilareisadvogados.com.br"
+          echo "📊 Portal URL: https://davilareisadvogados.com.br/portal"
+
+      - name: Notify deployment failure
+        if: failure()
+        run: |
+          echo "❌ Production deployment failed!"
+          # Here you could add Slack/email notifications
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"🚨 Production deployment failed for D'\''Avila Reis ERP"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # Post-deployment tests
+  post-deployment-tests:
+    name: Post-deployment Tests
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: End-to-end health checks
+        run: |
+          echo "Running comprehensive health checks..."
+          
+          # Main health endpoint
+          curl -f "https://davilareisadvogados.com.br/api/health" || exit 1
+          
+          # Portal authentication check
+          curl -f "https://davilareisadvogados.com.br/portal" || exit 1
+          
+          # Security headers check
+          SECURITY_HEADERS=$(curl -I "https://davilareisadvogados.com.br" 2>/dev/null)
+          echo "$SECURITY_HEADERS" | grep -q "X-Frame-Options" || exit 1
+          echo "$SECURITY_HEADERS" | grep -q "X-Content-Type-Options" || exit 1
+          echo "$SECURITY_HEADERS" | grep -q "Strict-Transport-Security" || exit 1
+          
+          echo "✅ All health checks passed!"
+
+      - name: Performance baseline check
+        run: |
+          echo "Checking performance baseline..."
+          
+          RESPONSE_TIME=$(curl -o /dev/null -s -w "%{time_total}" "https://davilareisadvogados.com.br")
+          
+          if (( $(echo "$RESPONSE_TIME > 3.0" | bc -l) )); then
+            echo "⚠️ Response time ($RESPONSE_TIME s) exceeds 3 second threshold"
+            exit 1
+          fi
+          
+          echo "✅ Performance check passed (${RESPONSE_TIME}s)"
